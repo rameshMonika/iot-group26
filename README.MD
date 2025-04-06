@@ -2,6 +2,9 @@ iot-modified
 --------------
 used to subscribe to sensor/alerts to send telegram message and alerts
 
+to run -> cd iot-modified -> docker-compose up -d --build
+
+
 MasterNode: 
 --------------
 script to publish to the topic "sensor/data" 
@@ -13,6 +16,10 @@ script to subscribe to the "sensor/data" to receive and process the data from th
 
 project-folder
 ----------------------
+consist of reciever_node_b and c
+
+Receiver Node A, B, C & D : receives the lora packet from the watch node via lora and send to Master Node
+
 Open Arduino IDE  
 
 Install esp32 by Expressif for ESP32 Board Modules 
