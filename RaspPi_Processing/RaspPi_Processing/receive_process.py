@@ -2,8 +2,20 @@ import paho.mqtt.client as mqtt
 import json
 import numpy as np
 
-# Global dictionary to hold aggregated data.
-# Key is a tuple (device_id, timestamp), value is an aggregation dict.
+# Global dictionary to hold aggregated data per device.
+# Structure:
+#   aggregated_data = {
+#       device_id: {
+#           "device_id": device_id,
+#           "nodes": {          # holds the most recent reading from each node
+#               "Node_A": { ... },
+#               "Node_B": { ... },
+#               "Node_C": { ... },
+#               "Node_D": { ... }
+#           }
+#       },
+#       ...
+#   }
 aggregated_data = {}
 
 # Global dictionary to maintain moving average history for each node.
@@ -18,8 +30,8 @@ node_locations = {
     "Node_D": [9, 2]
 }
 
-# Define the safe zone as a rectangular region:
-# Lower-left corner (4,3) and upper-right corner (6,5).
+# Define the safe zone as a rectangular region.
+# Lower-left corner (4, 0.2) and upper-right corner (6.7, 5.0)
 SAFE_ZONE = {
     "xmin": 4.0,
     "xmax": 6.7,
@@ -39,7 +51,7 @@ def validate_message(payload):
             return False, f"Missing key: {key}"
     try:
         rssi_val = float(payload["RSSI"])
-    except:
+    except Exception as e:
         return False, "RSSI is not a valid number"
     if rssi_val < -150 or rssi_val > 0:
         return False, f"RSSI value {rssi_val} out of range"
@@ -63,25 +75,17 @@ def noise_filter(node_id, rssi):
 def rssi_to_distance(filtered_rssi):
     """
     Convert filtered RSSI to distance using a simple linear model.
-    For this demo, we use:
-        distance = (abs(filtered_rssi) - 30) / 10
-    (This formula is arbitrary and used only for testing.)
+    For testing: distance = (abs(filtered_rssi) - 30) / 10.
     """
     distance = (abs(filtered_rssi) - 30) / 10
     return round(distance, 1)
 
 def trilateration(distance_data):
     """
-    Compute an estimated location (x, y) using a least-squares trilateration approach.
-    
-    Given at least three nodes with known locations and distances,
-    we linearize the circle equations by subtracting the equation for a reference node.
-    For each node i (i=2,...,N), we get:
-      2*(xi - x1)*x + 2*(yi - y1)*y = xi^2 - x1^2 + yi^2 - y1^2 + di^2 - d1^2
-    We then solve the resulting linear system via least squares.
+    Compute an estimated (x,y) location using a least-squares trilateration approach.
+    If fewer than 3 nodes are available, uses a fallback weighted average method.
     """
     if len(distance_data) < 3:
-        # Fallback: use weighted average if fewer than 3 nodes
         total_weight = 0
         x_sum = 0
         y_sum = 0
@@ -93,7 +97,7 @@ def trilateration(distance_data):
             y_sum += data["location"][1] * weight
         return [round(x_sum / total_weight, 1), round(y_sum / total_weight, 1)]
     
-    # Use the first node as reference.
+    # Use the first node as the reference.
     ref = distance_data[0]
     x1, y1 = ref["location"]
     d1 = ref["distance"]
@@ -107,7 +111,6 @@ def trilateration(distance_data):
         b.append(xi**2 - x1**2 + yi**2 - y1**2 + di**2 - d1**2)
     A = np.array(A)
     b = np.array(b)
-    
     solution, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
     estimated_x = round(solution[0], 1)
     estimated_y = round(solution[1], 1)
@@ -123,14 +126,13 @@ def is_within_safe_zone(location):
 
 def process_aggregated_data(agg_entry):
     """
-    For a given aggregated data entry:
-    1. Apply moving average filtering to each node’s RSSI.
-    2. Convert the filtered RSSI to a distance.
-    3. Use least-squares trilateration to estimate the device location.
-    4. Perform a geofencing check and output final status.
-    5. Publish final geofencing result to sensor/alerts topic.
+    Process the data by:
+      1. Applying a moving average filter.
+      2. Converting filtered RSSI to distances.
+      3. Performing trilateration.
+      4. Checking the geofence and publishing alerts.
     """
-    # Apply moving average filtering per node
+    # Apply noise filtering for each node’s RSSI
     filtered_data = []
     for entry in agg_entry["RSSI_data"]:
         original_rssi = entry["RSSI"]
@@ -141,7 +143,7 @@ def process_aggregated_data(agg_entry):
             "location": entry["location"]
         })
     
-    # Convert filtered RSSI to distance for each node
+    # Convert the filtered RSSI to distance for each node
     distance_data = []
     for entry in filtered_data:
         distance = rssi_to_distance(entry["filtered_RSSI"])
@@ -151,10 +153,9 @@ def process_aggregated_data(agg_entry):
             "location": entry["location"]
         })
     
-    # Perform trilateration to estimate the location of the device using the proper algorithm.
+    # Estimate location using trilateration
     estimated_location = trilateration(distance_data)
     
-    # Print the aggregated data, distance data, and estimated location
     print("Aggregated Data:")
     print(json.dumps(agg_entry, indent=2))
     print("\nDistance Data:")
@@ -164,12 +165,11 @@ def process_aggregated_data(agg_entry):
         "distance_data": distance_data
     }, indent=2))
     print("\nEstimated Location (Trilateration):", estimated_location)
-
-    # Geofencing Check
+    
+    # Perform geofencing check
     inside_zone = is_within_safe_zone(estimated_location)
     status = "Safe" if inside_zone else "ALERT: Patient Outside Safe Zone!"
-
-    # Final result output (what you see in the image)
+    
     final_result = {
         "device_id": agg_entry["device_id"],
         "timestamp": agg_entry["timestamp"],
@@ -179,9 +179,8 @@ def process_aggregated_data(agg_entry):
     print("\nGeofencing & Alerts:")
     print(json.dumps(final_result, indent=2))
     print("-" * 50, "\n")
-
-    # Publish the final_result to a new topic "sensor/alerts"
-    # Convert the dictionary to JSON string before publishing
+    
+    # Publish the final result to the alerts topic
     client.publish("sensor/alerts", json.dumps(final_result))
 
 ### MQTT Callback Functions ###
@@ -198,7 +197,7 @@ def on_message(client, userdata, msg):
         print("Failed to decode JSON:", e)
         return
 
-    # Validate the received message
+    # Validate the incoming message
     valid, validation_msg = validate_message(payload)
     if not valid:
         print("Invalid message:", validation_msg)
@@ -210,47 +209,52 @@ def on_message(client, userdata, msg):
     rssi = float(payload["RSSI"])
     timestamp = payload["timestamp"]
 
-    # Create an aggregation key (device_id, timestamp)
-    key = (device_id, timestamp)
-    if key not in aggregated_data:
-        aggregated_data[key] = {
+    # Aggregate by device_id. For each device, we store the most recent data per node.
+    if device_id not in aggregated_data:
+        aggregated_data[device_id] = {
             "device_id": device_id,
-            "timestamp": timestamp,
-            "RSSI_data": []
+            "nodes": {}  # key: node_id, value: reading
         }
     
-    # Check if this node's data is already present; if so, update it.
-    found = False
-    for entry in aggregated_data[key]["RSSI_data"]:
-        if entry["node_id"] == node_id:
-            entry["RSSI"] = rssi
-            found = True
-            break
-    if not found:
-        aggregated_data[key]["RSSI_data"].append({
-            "node_id": node_id,
-            "RSSI": rssi,
-            "location": node_locations[node_id]
-        })
+    # Update the entry for this node (overwriting any previous reading)
+    aggregated_data[device_id]["nodes"][node_id] = {
+        "node_id": node_id,
+        "RSSI": rssi,
+        "timestamp": timestamp,
+        "location": node_locations[node_id]
+    }
     
     print(f"Received Data: Device: {device_id}, Node: {node_id}, RSSI: {rssi}, Timestamp: {timestamp}")
     
-    # For demonstration, assume an aggregated set is complete when data from all 4 nodes is received.
-    if len(aggregated_data[key]["RSSI_data"]) >= 4:
-        process_aggregated_data(aggregated_data[key])
-        # Remove the processed aggregation to avoid reprocessing
-        del aggregated_data[key]
+    # Process only if we have readings from all 4 distinct nodes.
+    if len(aggregated_data[device_id]["nodes"]) == 4:
+        # Build the list from the node data
+        node_list = list(aggregated_data[device_id]["nodes"].values())
+        # Compute the maximum timestamp numerically
+        max_ts = max([int(n["timestamp"]) for n in node_list])
+        max_timestamp = str(max_ts)
+        
+        agg_entry = {
+            "device_id": device_id,
+            "timestamp": max_timestamp,
+            "RSSI_data": node_list
+        }
+        
+        process_aggregated_data(agg_entry)
+        
+        # Clear the stored nodes after processing so that a new set must be received.
+        aggregated_data[device_id]["nodes"] = {}
 
 ### MQTT Configuration ###
-MQTT_BROKER = "localhost"  # Broker is running on the Raspberry Pi itself
+MQTT_BROKER = "localhost"   # Broker is running on the Raspberry Pi itself
 MQTT_PORT = 1883
 MQTT_TOPIC = "sensor/data"
 
-# Create MQTT client and assign callbacks
+# Create MQTT client and assign callbacks.
 client = mqtt.Client()
 client.on_connect = on_connect
 client.on_message = on_message
 
-# Connect and start the loop
+# Connect and start the loop.
 client.connect(MQTT_BROKER, MQTT_PORT, 60)
 client.loop_forever()
