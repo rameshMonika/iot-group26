@@ -1,12 +1,14 @@
 import paho.mqtt.client as mqtt
 import json
 import numpy as np
+import time  # to handle time-based thresholds
 
 # Global dictionary to hold aggregated data per device.
 # Structure:
 #   aggregated_data = {
 #       device_id: {
 #           "device_id": device_id,
+#           "init_time": <time of first reading or last processing>,
 #           "nodes": {          # holds the most recent reading from each node
 #               "Node_A": { ... },
 #               "Node_B": { ... },
@@ -24,10 +26,10 @@ WINDOW_SIZE = 5
 
 # Mapping of node_id to its physical location (x, y)
 node_locations = {
-    "Node_A": [2, 5],
-    "Node_B": [10, 2],
-    "Node_C": [5, 7],
-    "Node_D": [9, 2]
+    "Node_A": [0, 0],
+    "Node_B": [10, 0],
+    "Node_C": [0, 8],
+    "Node_D": [10, 8]
 }
 
 # Define the safe zone as a rectangular region.
@@ -108,7 +110,7 @@ def trilateration(distance_data):
         xi, yi = data["location"]
         di = data["distance"]
         A.append([2 * (xi - x1), 2 * (yi - y1)])
-        b.append(xi**2 - x1**2 + yi**2 - y1**2 + di**2 - d1**2)
+        b.append(xi**2 - x1**2 + yi**2 - y1**2 + d1**2 - di**2)
     A = np.array(A)
     b = np.array(b)
     solution, residuals, rank, s = np.linalg.lstsq(A, b, rcond=None)
@@ -209,14 +211,15 @@ def on_message(client, userdata, msg):
     rssi = float(payload["RSSI"])
     timestamp = payload["timestamp"]
 
-    # Aggregate by device_id. For each device, we store the most recent data per node.
+    # Aggregate by device_id. For each device, store the most recent reading per node.
     if device_id not in aggregated_data:
         aggregated_data[device_id] = {
             "device_id": device_id,
-            "nodes": {}  # key: node_id, value: reading
+            "nodes": {},           # key: node_id, value: reading
+            "init_time": time.time()  # record the start time for this device
         }
     
-    # Update the entry for this node (overwriting any previous reading)
+    # Update the entry for this node (overwrite any previous reading)
     aggregated_data[device_id]["nodes"][node_id] = {
         "node_id": node_id,
         "RSSI": rssi,
@@ -226,11 +229,23 @@ def on_message(client, userdata, msg):
     
     print(f"Received Data: Device: {device_id}, Node: {node_id}, RSSI: {rssi}, Timestamp: {timestamp}")
     
-    # Process only if we have readings from all 4 distinct nodes.
-    if len(aggregated_data[device_id]["nodes"]) == 4:
-        # Build the list from the node data
+    # Determine elapsed time since first reading (or last processing) for this device
+    elapsed = time.time() - aggregated_data[device_id]["init_time"]
+
+    # Set the required minimum distinct nodes based on elapsed time:
+    # - For the first 30 seconds, require 4 distinct nodes.
+    # - From 30 to 60 seconds, require at least 3 distinct nodes.
+    # - After 60 seconds, require at least 2 distinct nodes.
+    if elapsed < 30:
+        required_nodes = 4
+    elif elapsed < 60:
+        required_nodes = 3
+    else:
+        required_nodes = 2
+
+    # Process if we have at least the required number of distinct node readings.
+    if len(aggregated_data[device_id]["nodes"]) >= required_nodes:
         node_list = list(aggregated_data[device_id]["nodes"].values())
-        # Compute the maximum timestamp numerically
         max_ts = max([int(n["timestamp"]) for n in node_list])
         max_timestamp = str(max_ts)
         
@@ -242,8 +257,9 @@ def on_message(client, userdata, msg):
         
         process_aggregated_data(agg_entry)
         
-        # Clear the stored nodes after processing so that a new set must be received.
+        # Clear the stored nodes and reset the init_time for a new measurement cycle
         aggregated_data[device_id]["nodes"] = {}
+        aggregated_data[device_id]["init_time"] = time.time()
 
 ### MQTT Configuration ###
 MQTT_BROKER = "localhost"   # Broker is running on the Raspberry Pi itself
